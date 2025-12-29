@@ -1,29 +1,5 @@
 """
-Ray Train + DeepSpeed AutoTP Tensor Parallelism Training.
-
-This script demonstrates training with DeepSpeed AutoTP tensor parallelism
-using Ray Train's TorchTrainer for distributed execution and checkpointing.
-
-Example usage:
-    # 8 GPUs: 4-way tensor parallelism, 2-way data parallelism
-    python train.py \
-        --model_name Qwen/Qwen2-7B \
-        --tp_size 4 \
-        --dp_size 2 \
-        --num_workers 8 \
-        --dataset_name wikitext \
-        --batch_size 2 \
-        --seq_length 2048 \
-        --num_epochs 3
-
-    # 4 GPUs: 4-way tensor parallelism only
-    python train.py \
-        --model_name Qwen/Qwen2-7B \
-        --tp_size 4 \
-        --dp_size 1 \
-        --num_workers 4 \
-        --dataset_name wikitext \
-        --num_epochs 3
+Common utilities shared between DeepSpeed AutoTP and FSDP+DTensor training scripts.
 """
 
 import argparse
@@ -32,11 +8,8 @@ import logging
 import os
 import tempfile
 import uuid
-from typing import Any, Dict
+from typing import Any, Callable, Dict, Protocol
 
-os.environ["RAY_TRAIN_V2_ENABLED"] = "1"
-
-import deepspeed
 import torch
 
 import ray
@@ -45,10 +18,46 @@ import ray.train.torch
 from ray.train import Checkpoint, RunConfig, ScalingConfig
 from ray.train.torch import TorchTrainer
 
-from autotp_strategy import RayAutoTPStrategy
 from data import create_tp_aware_dataloader
 
 logger = logging.getLogger(__name__)
+
+
+class TPStrategy(Protocol):
+    """Protocol defining the interface for tensor parallelism strategies."""
+
+    tp_rank: int
+    dp_rank: int
+    tp_size: int
+    dp_size: int
+
+    def setup(self, model_name: str, device: torch.device, dtype: torch.dtype, config: Dict[str, Any]) -> None:
+        ...
+
+    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        ...
+
+    def backward(self, loss: torch.Tensor) -> None:
+        ...
+
+    def forward_backward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Optional: Combined forward+backward for strategies that need it (e.g., DTensor with loss_parallel)."""
+        ...
+
+    def optimizer_step(self) -> None:
+        ...
+
+    def zero_grad(self) -> None:
+        ...
+
+    def train(self) -> None:
+        ...
+
+    def save_checkpoint(self, checkpoint_dir: str, tag: str = "model") -> None:
+        ...
+
+    def load_checkpoint(self, checkpoint_dir: str, tag: str = "model") -> None:
+        ...
 
 
 def log_rank0(message: str) -> None:
@@ -58,7 +67,7 @@ def log_rank0(message: str) -> None:
 
 
 def save_checkpoint(
-    strategy: RayAutoTPStrategy,
+    strategy: TPStrategy,
     epoch: int,
     step: int,
     metrics: Dict[str, Any],
@@ -70,7 +79,7 @@ def save_checkpoint(
     Ray Train aggregates checkpoints from all workers properly.
 
     Args:
-        strategy: The AutoTP strategy containing the DeepSpeed engine
+        strategy: The TP strategy containing the model/engine
         epoch: Current epoch number
         step: Current step number
         metrics: Training metrics to report
@@ -81,7 +90,7 @@ def save_checkpoint(
         checkpoint_dir = os.path.join(tmp_dir, "checkpoint")
         os.makedirs(checkpoint_dir, exist_ok=True)
 
-        # DeepSpeed saves each rank's shard
+        # Save checkpoint (each rank saves its shard)
         strategy.save_checkpoint(checkpoint_dir, tag="model")
 
         # Save metadata (from world rank 0 only)
@@ -100,7 +109,7 @@ def save_checkpoint(
 
 
 def load_checkpoint(
-    strategy: RayAutoTPStrategy,
+    strategy: TPStrategy,
     checkpoint: ray.train.Checkpoint,
 ) -> Dict[str, Any]:
     """
@@ -109,7 +118,7 @@ def load_checkpoint(
     Each rank loads its corresponding checkpoint shard.
 
     Args:
-        strategy: The AutoTP strategy containing the DeepSpeed engine
+        strategy: The TP strategy containing the model/engine
         checkpoint: Ray Train checkpoint to load
 
     Returns:
@@ -124,7 +133,7 @@ def load_checkpoint(
             if not os.path.isdir(ckpt_dir):
                 ckpt_dir = checkpoint_dir
 
-            # Load DeepSpeed checkpoint (each rank loads its shard)
+            # Load checkpoint (each rank loads its shard)
             strategy.load_checkpoint(ckpt_dir, tag="model")
 
             # Read metadata
@@ -146,46 +155,19 @@ def load_checkpoint(
     return metadata
 
 
-def train_loop_per_worker(config: Dict[str, Any]) -> None:
+def run_training_loop(
+    strategy: TPStrategy,
+    config: Dict[str, Any],
+) -> None:
     """
-    Main training loop executed by each Ray Train worker.
+    Run the common training loop for any TP strategy.
 
     Args:
+        strategy: The TP strategy (already set up)
         config: Training configuration dict
     """
-    # Get Ray Train context
-    ctx = ray.train.get_context()
-    world_rank = ctx.get_world_rank()
-    world_size = ctx.get_world_size()
+    world_rank = ray.train.get_context().get_world_rank()
     device = ray.train.torch.get_device()
-
-    log_rank0(f"Worker started: world_rank={world_rank}, world_size={world_size}")
-
-    # Initialize DeepSpeed distributed (will detect and use existing process group from Ray Train)
-    deepspeed.init_distributed()
-
-    # Create and setup the AutoTP strategy
-    strategy = RayAutoTPStrategy(
-        tp_size=config["tp_size"],
-        dp_size=config["dp_size"],
-    )
-
-    strategy.setup(
-        model_name=config["model_name"],
-        device=device,
-        dtype=torch.bfloat16,
-        config={
-            "batch_size": config["batch_size"],
-            "learning_rate": config["learning_rate"],
-            "weight_decay": config.get("weight_decay", 0.01),
-            "max_grad_norm": config.get("max_grad_norm", 1.0),
-            "zero_stage": config["zero_stage"],
-            "gradient_accumulation_steps": config.get("gradient_accumulation_steps", 1),
-            "num_layers": config.get("num_layers", 0),
-            "attn_impl": config.get("attn_impl", "sdpa"),
-            "activation_checkpointing": config.get("activation_checkpointing", False),
-        },
-    )
 
     # Create TP-aware dataloader
     # Uses dp_rank/dp_size for sharding, not world_rank/world_size
@@ -222,21 +204,31 @@ def train_loop_per_worker(config: Dict[str, Any]) -> None:
         running_loss = 0.0
         num_batches = 0
 
+        # Check if strategy has combined forward_backward (needed for DTensor with loss_parallel)
+        use_forward_backward = hasattr(strategy, "forward_backward") and callable(
+            getattr(strategy, "forward_backward", None)
+        )
+
         for step, batch in enumerate(dataloader):
             # Move batch to device
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            # Forward pass
-            loss = strategy.forward(batch)
+            # Zero gradients (for FSDP, DeepSpeed handles this internally)
+            strategy.zero_grad()
+
+            if use_forward_backward:
+                # Combined forward+backward (required for DTensor with loss_parallel)
+                loss = strategy.forward_backward(batch)
+            else:
+                # Separate forward and backward passes
+                loss = strategy.forward(batch)
+                strategy.backward(loss)
 
             # Log progress
             if world_rank == 0 and step % config.get("log_interval", 10) == 0:
                 log_rank0(
                     f"Epoch: {epoch} Step: {step + 1}/{steps_per_epoch} Loss: {loss.item():.4f}"
                 )
-
-            # Backward pass
-            strategy.backward(loss)
 
             # Optimizer step
             strategy.optimizer_step()
@@ -263,12 +255,8 @@ def train_loop_per_worker(config: Dict[str, Any]) -> None:
         log_rank0(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")
 
 
-def get_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Ray Train + DeepSpeed AutoTP Tensor Parallelism Training"
-    )
-
+def add_common_args(parser: argparse.ArgumentParser) -> None:
+    """Add common arguments shared by all training scripts."""
     # Model configuration
     parser.add_argument(
         "--model_name",
@@ -308,13 +296,6 @@ def get_args():
         type=int,
         required=True,
         help="Total number of workers (must equal tp_size * dp_size)",
-    )
-    parser.add_argument(
-        "--zero_stage",
-        type=int,
-        default=1,
-        choices=[0, 1, 2],
-        help="DeepSpeed ZeRO stage (0-2, ZeRO-3 not supported with AutoTP)",
     )
 
     # Dataset configuration
@@ -420,29 +401,10 @@ def get_args():
         help="Random seed",
     )
 
-    return parser.parse_args()
 
-
-def main():
-    """Main entry point."""
-    args = get_args()
-
-    # Validate parallelism configuration
-    if args.tp_size * args.dp_size != args.num_workers:
-        raise ValueError(
-            f"tp_size ({args.tp_size}) * dp_size ({args.dp_size}) "
-            f"must equal num_workers ({args.num_workers})"
-        )
-
-    print(f"Configuration: {args}")
-
-    # Configure Ray Train
-    scaling_config = ScalingConfig(
-        num_workers=args.num_workers,
-        use_gpu=True,
-    )
-
-    train_loop_config = {
+def get_common_train_config(args: argparse.Namespace) -> Dict[str, Any]:
+    """Build common train_loop_config from parsed args."""
+    return {
         # Model
         "model_name": args.model_name,
         "num_layers": args.num_layers,
@@ -450,7 +412,6 @@ def main():
         # Parallelism
         "tp_size": args.tp_size,
         "dp_size": args.dp_size,
-        "zero_stage": args.zero_stage,
         # Dataset
         "dataset_name": args.dataset_name,
         "dataset_percentage": args.dataset_percentage,
@@ -469,13 +430,44 @@ def main():
         "seed": args.seed,
     }
 
+
+def run_trainer(
+    args: argparse.Namespace,
+    train_loop_per_worker: Callable[[Dict[str, Any]], None],
+    train_loop_config: Dict[str, Any],
+    experiment_prefix: str,
+) -> None:
+    """
+    Common trainer setup and execution.
+
+    Args:
+        args: Parsed command line arguments
+        train_loop_per_worker: The training loop function
+        train_loop_config: Configuration dict for training
+        experiment_prefix: Prefix for auto-generated experiment names
+    """
+    # Validate parallelism configuration
+    if args.tp_size * args.dp_size != args.num_workers:
+        raise ValueError(
+            f"tp_size ({args.tp_size}) * dp_size ({args.dp_size}) "
+            f"must equal num_workers ({args.num_workers})"
+        )
+
+    print(f"Configuration: {args}")
+
+    # Configure Ray Train
+    scaling_config = ScalingConfig(
+        num_workers=args.num_workers,
+        use_gpu=True,
+    )
+
     # Generate experiment name
     name = args.experiment_name
     if name is None:
         if args.resume_from is not None:
             name = args.resume_from
         else:
-            name = f"autotp_tp{args.tp_size}_dp{args.dp_size}_{uuid.uuid4().hex[:8]}"
+            name = f"{experiment_prefix}_tp{args.tp_size}_dp{args.dp_size}_{uuid.uuid4().hex[:8]}"
 
     print(f"Experiment name: {name}")
 
@@ -494,7 +486,3 @@ def main():
 
     result = trainer.fit()
     print(f"Training finished. Result: {result}")
-
-
-if __name__ == "__main__":
-    main()
