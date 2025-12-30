@@ -58,10 +58,69 @@ python train_fsdp.py \
 |----------|-------------|---------|
 | `--autocast` | Enable torch.autocast for mixed precision | `False` |
 
+## Anyscale Job Configs
+
+Pre-configured job files are provided for running on Anyscale:
+
+```bash
+# DeepSpeed AutoTP
+anyscale job submit -f job_deepspeed.yaml
+
+# FSDP + DTensor
+anyscale job submit -f job_fsdp.yaml
+```
+
+### Common Settings
+
+Both jobs share these configurations:
+
+| Setting | Value | Description |
+|---------|-------|-------------|
+| `model_name` | `Qwen/Qwen2.5-0.5B` | Small model for testing |
+| `tp_size` | 2 | Tensor parallel degree (must divide num_key_value_heads) |
+| `dp_size` | 2 | Data parallel degree |
+| `num_workers` | 4 | Total GPUs (tp_size × dp_size) |
+| `seq_length` | 1024 | Sequence length |
+| `batch_size` | 2 | Per-GPU micro batch size |
+| `dataset_percentage` | 1.0 | Use 1% of dataset for quick testing |
+| `num_epochs` | 1 | Number of training epochs |
+| `log_interval` | 1 | Log every step |
+| `image_uri` | `anyscale/ray:2.53.0-slim-py312-cu128` | Ray image with CUDA 12.8 |
+| `instance_type` | `g4dn.12xlarge` | 4x T4 GPUs per node |
+| `num_nodes` | 1 | Single node |
+
+### DeepSpeed-specific Settings (`job_deepspeed.yaml`)
+
+| Setting | Value | Description |
+|---------|-------|-------------|
+| `zero_stage` | 1 | DeepSpeed ZeRO optimization stage (0-2) |
+
+Requirements: `torch>=2.9.1`, `deepspeed>=0.18.3`, `transformers>=4.45.0`, `datasets>=3.0.0`, `accelerate>=1.0.0`
+
+### FSDP-specific Settings (`job_fsdp.yaml`)
+
+| Setting | Value | Description |
+|---------|-------|-------------|
+| `autocast` | False (default) | Enable torch.autocast for mixed precision |
+
+Requirements: `torch>=2.9.1`, `transformers>=4.45.0`, `datasets>=3.0.0`, `accelerate>=1.0.0`
+
+### Customizing Job Configs
+
+Override settings via command line:
+
+```bash
+# Use larger model with more GPUs
+anyscale job submit -f job_deepspeed.yaml \
+  --entrypoint "python train_deepspeed.py --model_name Qwen/Qwen2-7B --tp_size 4 --dp_size 2 --num_workers 8"
+```
+
+**Important**: `tp_size` must evenly divide the model's `num_key_value_heads`. For Qwen2.5-0.5B (2 KV heads), valid values are 1 or 2.
+
 ## File Structure
 
 ```
-train_tensor_parallel_deepspeed/
+train_tensor_parallel/
 ├── train_deepspeed.py     # DeepSpeed AutoTP entry point
 ├── train_fsdp.py          # FSDP+DTensor entry point
 ├── common.py              # Shared utilities (training loop, checkpointing)
@@ -69,7 +128,9 @@ train_tensor_parallel_deepspeed/
 ├── fsdp_strategy.py       # FSDP2+DTensor strategy
 ├── vocab_parallel.py      # Vocabulary parallel embedding and loss
 ├── model_builder.py       # Model creation utilities
-└── data.py                # TP-aware data loading
+├── data.py                # TP-aware data loading
+├── job_deepspeed.yaml     # Anyscale job config for DeepSpeed
+└── job_fsdp.yaml          # Anyscale job config for FSDP
 ```
 
 ## How 2D Parallelism Works

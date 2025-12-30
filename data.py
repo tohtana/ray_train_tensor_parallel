@@ -2,10 +2,27 @@
 
 from typing import Any
 
+import torch.distributed as dist
 from datasets import DownloadConfig, load_dataset
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer
+
+import ray.train
+
+
+def _get_world_rank() -> int:
+    """Get world rank, handling both distributed and non-distributed cases."""
+    try:
+        return ray.train.get_context().get_world_rank()
+    except Exception:
+        return 0
+
+
+def _barrier():
+    """Synchronize all workers."""
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
 
 def get_tokenizer(model_name: str, trust_remote_code: bool = True) -> Any:
@@ -68,22 +85,37 @@ def create_tp_aware_dataloader(
     Returns:
         DataLoader with TP-aware sharding
     """
-    tokenizer = get_tokenizer(model_name)
-
-    # Load dataset with specified percentage
-    split_spec = f"train[:{int(dataset_percentage)}%]"
+    world_rank = _get_world_rank()
 
     # Handle datasets that require a config name
     dataset_config = None
     if dataset_name == "wikitext":
         dataset_config = "wikitext-2-raw-v1"
 
-    dataset = load_dataset(
-        dataset_name,
-        dataset_config,
-        split=split_spec,
-        download_config=DownloadConfig(disable_tqdm=True),
-    )
+    split_spec = f"train[:{int(dataset_percentage)}%]"
+
+    # Rank 0 downloads tokenizer and dataset first to avoid file handle conflicts
+    if world_rank == 0:
+        tokenizer = get_tokenizer(model_name)
+        dataset = load_dataset(
+            dataset_name,
+            dataset_config,
+            split=split_spec,
+            download_config=DownloadConfig(disable_tqdm=True),
+        )
+
+    # Wait for rank 0 to finish downloading
+    _barrier()
+
+    # Other ranks load from cache
+    if world_rank != 0:
+        tokenizer = get_tokenizer(model_name)
+        dataset = load_dataset(
+            dataset_name,
+            dataset_config,
+            split=split_spec,
+            download_config=DownloadConfig(disable_tqdm=True),
+        )
 
     def tokenize_function(examples):
         return tokenizer(
