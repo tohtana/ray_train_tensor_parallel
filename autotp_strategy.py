@@ -224,8 +224,18 @@ class RayAutoTPStrategy:
                 "bf16_master_weights_and_grads": True,
                 "bf16_optimizer_states": True,
             }
+            # Enable PyTorch native autocast for bfloat16
+            ds_config["torch_autocast"] = {
+                "enabled": True,
+                "dtype": "bfloat16",
+            }
         elif dtype == torch.float16:
             ds_config["fp16"] = {"enabled": True, "initial_scale_power": 8}
+            # Enable PyTorch native autocast for float16
+            ds_config["torch_autocast"] = {
+                "enabled": True,
+                "dtype": "float16",
+            }
 
         # Create optimizer
         learning_rate = config.get("learning_rate", 1e-5)
@@ -249,6 +259,8 @@ class RayAutoTPStrategy:
             print(f"[AutoTP] DeepSpeed engine created with ZeRO-{zero_stage}")
             if self.dp_size > 1:
                 print(f"[AutoTP] 2D parallelism: {self.dp_size} DP x {self.tp_size} TP")
+            if "torch_autocast" in ds_config:
+                print(f"[AutoTP] torch.autocast enabled with dtype={ds_config['torch_autocast']['dtype']}")
 
     def _apply_vocab_parallel_embedding(
         self,

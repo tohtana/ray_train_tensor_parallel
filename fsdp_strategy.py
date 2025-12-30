@@ -196,8 +196,10 @@ class RayFSDPStrategy:
             if self.dp_size > 1:
                 print(f"[FSDP2+DTensor] 2D parallelism: {self.dp_size} DP x {self.tp_size} TP")
 
-        # Configure autocast if enabled
-        self.use_autocast = config.get("autocast", False)
+        # Configure autocast - enabled by default for mixed precision dtypes (bf16/fp16)
+        # Can be explicitly disabled via config["autocast"] = False
+        autocast_default = dtype in (torch.bfloat16, torch.float16)
+        self.use_autocast = config.get("autocast", autocast_default)
         if self.use_autocast:
             self.autocast_dtype = dtype
             if self.rank == 0:
