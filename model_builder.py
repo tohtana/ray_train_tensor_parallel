@@ -2,7 +2,6 @@
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -132,82 +131,6 @@ def create_model(
     model = model.to(dtype=dtype)
 
     return model
-
-
-def get_embedding_module(model: nn.Module) -> Optional[nn.Embedding]:
-    """
-    Get the embedding module from the model.
-
-    Args:
-        model: The model to get embedding from
-
-    Returns:
-        The embedding module, or None if not found
-    """
-    # Try common embedding locations
-    # Qwen/Llama/Mistral structure: model.model.embed_tokens
-    if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
-        return model.model.embed_tokens
-
-    # GPT-2 structure: model.transformer.wte
-    if hasattr(model, "transformer") and hasattr(model.transformer, "wte"):
-        return model.transformer.wte
-
-    # Generic: model.embed_tokens
-    if hasattr(model, "embed_tokens"):
-        return model.embed_tokens
-
-    return None
-
-
-def replace_embedding_module(model: nn.Module, new_embedding: nn.Module) -> bool:
-    """
-    Replace the embedding module in the model.
-
-    Args:
-        model: The model whose embedding should be replaced
-        new_embedding: The new embedding module (e.g., VocabParallelEmbedding)
-
-    Returns:
-        True if successful, False otherwise
-    """
-    # Try common embedding locations
-    # Qwen/Llama/Mistral structure: model.model.embed_tokens
-    if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
-        model.model.embed_tokens = new_embedding
-        return True
-
-    # GPT-2 structure: model.transformer.wte
-    if hasattr(model, "transformer") and hasattr(model.transformer, "wte"):
-        model.transformer.wte = new_embedding
-        return True
-
-    # Generic: model.embed_tokens
-    if hasattr(model, "embed_tokens"):
-        model.embed_tokens = new_embedding
-        return True
-
-    return False
-
-
-def get_lm_head(model: nn.Module) -> Optional[nn.Linear]:
-    """
-    Get the language model head from the model.
-
-    Args:
-        model: The model to get lm_head from
-
-    Returns:
-        The lm_head linear layer, or None if not found
-    """
-    if hasattr(model, "lm_head"):
-        return model.lm_head
-
-    # GPT-2 structure uses same weights as embedding
-    if hasattr(model, "transformer") and hasattr(model.transformer, "wte"):
-        return None  # GPT-2 ties weights
-
-    return None
 
 
 def get_transformer_layers(model: nn.Module):

@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor.parallel import loss_parallel, parallelize_module
+from torch.distributed.tensor.parallel import parallelize_module
 
 from model_builder import (
     create_model,
@@ -63,7 +63,6 @@ class RayFSDPStrategy:
         - tp dimension: DTensor shards model weights for tensor parallelism
         """
         from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
-        from torch.distributed.tensor import Replicate, Shard
         from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
 
         self.device = device
@@ -153,29 +152,6 @@ class RayFSDPStrategy:
         for layer in layers:
             parallelize_module(layer, self.tp_mesh, tp_mapping)
 
-        # Apply DTensor TP to embedding and lm_head for vocab parallelism
-        # (only if vocab_parallel is enabled)
-        self._vocab_parallel = config.get("vocab_parallel", False)
-        if self._vocab_parallel:
-            vocab_parallel_mapping = {
-                "model.embed_tokens": RowwiseParallel(
-                    input_layouts=Replicate(),
-                    output_layouts=Shard(1),
-                ),
-                "lm_head": ColwiseParallel(
-                    input_layouts=Shard(1),
-                    output_layouts=Shard(-1),  # Shard output by vocab dimension for loss_parallel
-                    use_local_output=False,
-                ),
-            }
-            parallelize_module(model, self.tp_mesh, vocab_parallel_mapping)
-
-            if self.rank == 0:
-                print("[FSDP2+DTensor] Applied vocab parallel TP to embedding and lm_head")
-        else:
-            if self.rank == 0:
-                print("[FSDP2+DTensor] Vocab parallel disabled - using full embedding/lm_head")
-
         # Apply FSDP2 (fully_shard) if dp_size > 1
         mp_policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
 
@@ -220,22 +196,14 @@ class RayFSDPStrategy:
                 print(f"[FSDP2+DTensor] torch.autocast enabled with dtype={dtype_name}")
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Run forward pass with FSDP2+DTensor model.
-
-        Note: For vocab-parallel DTensor, use forward_backward() instead
-        as loss_parallel() must wrap both forward and backward together.
-        """
+        """Run forward pass with FSDP2+DTensor model."""
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=self.autocast_dtype)
             if self.use_autocast
             else nullcontext()
         )
 
-        # Only use loss_parallel() when vocab_parallel is enabled
-        loss_ctx = loss_parallel() if self._vocab_parallel else nullcontext()
-
-        with autocast_ctx, loss_ctx:
+        with autocast_ctx:
             outputs = self.model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
@@ -252,33 +220,11 @@ class RayFSDPStrategy:
         """
         Run forward and backward pass together.
 
-        For vocab-parallel DTensor, loss_parallel() context must wrap BOTH
-        forward and backward passes together. This method handles that requirement.
-
         Returns:
             The loss value (for logging)
         """
-        autocast_ctx = (
-            torch.autocast(device_type="cuda", dtype=self.autocast_dtype)
-            if self.use_autocast
-            else nullcontext()
-        )
-
-        # Only use loss_parallel() when vocab_parallel is enabled
-        # loss_parallel context MUST wrap both forward and backward for
-        # correct gradient computation with vocab-sharded DTensor
-        loss_ctx = loss_parallel() if self._vocab_parallel else nullcontext()
-
-        with autocast_ctx, loss_ctx:
-            outputs = self.model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                labels=batch["labels"],
-                use_cache=False,
-            )
-            loss = outputs.loss
-            loss.backward()
-
+        loss = self.forward(batch)
+        loss.backward()
         return loss
 
     def optimizer_step(self) -> None:

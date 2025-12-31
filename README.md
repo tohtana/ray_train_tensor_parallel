@@ -52,12 +52,6 @@ python train_fsdp.py \
 |----------|-------------|---------|
 | `--zero_stage` | ZeRO optimization stage (0-2) | `1` |
 
-### FSDP-specific
-
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `--vocab_parallel` | Enable vocab parallel for embedding/lm_head | `False` |
-
 Note: Autocast is always enabled for bf16/fp16 dtypes in the FSDP path.
 
 ## Anyscale Job Configs
@@ -126,7 +120,6 @@ train_tensor_parallel/
 ├── common.py              # Shared utilities (training loop, checkpointing)
 ├── autotp_strategy.py     # DeepSpeed AutoTP strategy
 ├── fsdp_strategy.py       # FSDP2+DTensor strategy
-├── vocab_parallel.py      # Vocabulary parallel embedding and loss
 ├── model_builder.py       # Model creation utilities
 ├── data.py                # TP-aware data loading
 ├── job_deepspeed.yaml     # Anyscale job config for DeepSpeed
@@ -167,10 +160,6 @@ sampler = DistributedSampler(
     rank=dp_rank,          # NOT world_rank
 )
 ```
-
-### Vocabulary Parallelism
-
-Both implementations shard the embedding and output projection layers across the vocabulary dimension for memory efficiency. This requires special handling for the cross-entropy loss computation.
 
 ### Checkpointing
 

@@ -10,14 +10,7 @@ import torch.nn as nn
 from model_builder import (
     ModelConfig,
     create_model,
-    get_embedding_module,
-    get_lm_head,
     get_model_config,
-    replace_embedding_module,
-)
-from vocab_parallel import (
-    VocabParallelEmbedding,
-    vocab_parallel_causal_cross_entropy,
 )
 
 
@@ -242,14 +235,6 @@ class RayAutoTPStrategy:
             tp_group=self.tp_group,
         )
 
-        # Apply vocabulary-parallel embedding for proper parallel loss computation
-        # (only if vocab_parallel is enabled)
-        self._vocab_parallel = config.get("vocab_parallel", False)
-        if self.tp_group is not None and self._vocab_parallel:
-            self._apply_vocab_parallel_embedding(model, device, dtype)
-        elif self.rank == 0:
-            print("[AutoTP] Vocab parallel disabled - using full embedding/lm_head")
-
         # Get all parameters
         params = list(model.parameters())
 
@@ -324,117 +309,15 @@ class RayAutoTPStrategy:
             if "torch_autocast" in ds_config:
                 print(f"[AutoTP] torch.autocast enabled with dtype={ds_config['torch_autocast']['dtype']}")
 
-    def _apply_vocab_parallel_embedding(
-        self,
-        model: nn.Module,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> None:
-        """
-        Apply vocabulary-parallel embedding to the model.
-
-        DeepSpeed AutoTP doesn't partition embeddings/lm_head by vocabulary dimension,
-        so we replace them with VocabParallelEmbedding for correct loss computation.
-
-        IMPORTANT: The embedding weights must be synchronized across TP ranks before
-        partitioning, because DeepSpeed tp_model_init() does not synchronize embedding
-        weights and each rank may have different random initializations.
-        """
-        original_embedding = get_embedding_module(model)
-        if original_embedding is None:
-            if self.rank == 0:
-                print("[AutoTP] Warning: Could not find embedding module, skipping vocab parallel")
-            return
-
-        if self.rank == 0:
-            print(
-                f"[AutoTP] Replacing embedding with VocabParallelEmbedding "
-                f"(vocab_size={original_embedding.num_embeddings}, tp_size={self.tp_size})"
-            )
-
-        # Note: Embedding weights are already synchronized by _sync_model_weights()
-        # before tp_model_init(), so no additional broadcast is needed here.
-
-        # Create VocabParallelEmbedding
-        vocab_parallel_embedding = VocabParallelEmbedding(
-            num_embeddings=original_embedding.num_embeddings,
-            embedding_dim=original_embedding.embedding_dim,
-            padding_idx=original_embedding.padding_idx,
-            tp_group=self.tp_group,
-            dtype=dtype,
-            device=device,
-        )
-
-        # Copy the appropriate partition of weights from original embedding
-        with torch.no_grad():
-            start_idx = vocab_parallel_embedding.vocab_start_index
-            end_idx = vocab_parallel_embedding.vocab_end_index
-            vocab_parallel_embedding.weight.data.copy_(
-                original_embedding.weight.data[start_idx:end_idx]
-            )
-
-        # Replace the embedding in the model
-        if not replace_embedding_module(model, vocab_parallel_embedding):
-            if self.rank == 0:
-                print("[AutoTP] Warning: Could not replace embedding module")
-            return
-
-        # Handle lm_head based on weight tying configuration
-        lm_head = get_lm_head(model)
-        if lm_head is not None:
-            tie_word_embeddings = getattr(model.config, "tie_word_embeddings", True)
-            if tie_word_embeddings:
-                # Tied weights: lm_head shares weight with embedding
-                # Since embedding weights were already broadcasted and partitioned,
-                # just tie lm_head to the new VocabParallelEmbedding weight
-                lm_head.weight = vocab_parallel_embedding.weight
-                if self.rank == 0:
-                    print("[AutoTP] lm_head weight tied to VocabParallelEmbedding")
-            else:
-                # Untied weights: lm_head needs its own partitioned weight
-                # Note: lm_head weights are already synchronized by _sync_model_weights()
-                # before tp_model_init(), so no additional broadcast is needed here.
-                original_lm_head_weight = lm_head.weight.data.clone()
-                lm_head.weight = nn.Parameter(
-                    original_lm_head_weight[start_idx:end_idx, :].to(device)
-                )
-                if self.rank == 0:
-                    print("[AutoTP] lm_head weight sharded independently (untied)")
-
-        if self.rank == 0:
-            print(
-                f"[AutoTP] VocabParallelEmbedding applied: vocab_range=[{start_idx}, {end_idx}), "
-                f"partition_size={end_idx - start_idx}"
-            )
-
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Run forward pass with AutoTP model."""
-        # Use vocab-parallel loss computation only if vocab_parallel is enabled
-        if self._vocab_parallel and self.tp_group is not None:
-            outputs = self.engine(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                use_cache=False,
-            )
-            # Compute vocab-parallel loss
-            loss = vocab_parallel_causal_cross_entropy(
-                outputs.logits,
-                batch["labels"],
-                self.tp_group,
-                self.tp_rank,
-                self.tp_size,
-                ignore_index=-100,
-            )
-            return loss
-        else:
-            # Use model's built-in loss computation (full embedding/lm_head)
-            outputs = self.engine(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                labels=batch["labels"],
-                use_cache=False,
-            )
-            return outputs.loss
+        outputs = self.engine(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            labels=batch["labels"],
+            use_cache=False,
+        )
+        return outputs.loss
 
     def backward(self, loss: torch.Tensor) -> None:
         """Run backward pass through DeepSpeed engine."""

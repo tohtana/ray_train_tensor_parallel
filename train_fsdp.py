@@ -96,13 +96,6 @@ def get_args():
     # Add common arguments
     add_common_args(parser)
 
-    # FSDP-specific arguments
-    parser.add_argument(
-        "--vocab_parallel",
-        action="store_true",
-        help="Enable vocab parallel for embedding/lm_head (disabled by default)",
-    )
-
     return parser.parse_args()
 
 
@@ -112,7 +105,6 @@ def main():
 
     # Build train_loop_config
     train_loop_config = get_common_train_config(args)
-    train_loop_config["vocab_parallel"] = args.vocab_parallel
     train_loop_config["impl_name"] = "fsdp"
 
     # Run trainer
