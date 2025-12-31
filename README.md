@@ -234,3 +234,7 @@ FSDP+DTensor (TP=2, DP=2):
   Min loss:     0.723624
   Mean loss:    7.341585
 ```
+
+#### Verification Plot
+
+![Training Loss Curves](loss_curves.png)
