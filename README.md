@@ -56,7 +56,9 @@ python train_fsdp.py \
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--autocast` | Enable torch.autocast for mixed precision | `False` |
+| `--vocab_parallel` | Enable vocab parallel for embedding/lm_head | `False` |
+
+Note: Autocast is always enabled for bf16/fp16 dtypes in the FSDP path.
 
 ## Anyscale Job Configs
 
@@ -99,9 +101,7 @@ Requirements: `torch>=2.9.1`, `deepspeed>=0.18.3`, `transformers>=4.45.0`, `data
 
 ### FSDP-specific Settings (`job_fsdp.yaml`)
 
-| Setting | Value | Description |
-|---------|-------|-------------|
-| `autocast` | False (default) | Enable torch.autocast for mixed precision |
+Autocast is always enabled for bf16/fp16 dtypes.
 
 Requirements: `torch>=2.9.1`, `transformers>=4.45.0`, `datasets>=3.0.0`, `accelerate>=1.0.0`
 
