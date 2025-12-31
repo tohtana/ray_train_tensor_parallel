@@ -49,41 +49,19 @@ def plot_loss_curves(input_dir: str, output_path: str):
         print("No loss histories found!")
         return
 
-    # Create figure with two subplots
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    # Create figure
+    fig, ax = plt.subplots(figsize=(10, 6))
 
-    # Plot 1: Full loss curves
-    ax1 = axes[0]
+    # Plot loss curves
     for name, losses in implementations.items():
         steps = list(range(len(losses)))
-        ax1.plot(steps, losses, label=name, color=colors[name], linewidth=1.5)
+        ax.plot(steps, losses, label=name, color=colors[name], linewidth=1.5)
 
-    ax1.set_xlabel("Step", fontsize=12)
-    ax1.set_ylabel("Loss", fontsize=12)
-    ax1.set_title("Training Loss Curves (100 Steps)", fontsize=14)
-    ax1.legend(loc="upper right", fontsize=10)
-    ax1.grid(True, alpha=0.3)
-
-    # Plot 2: Difference from DDP baseline
-    ax2 = axes[1]
-    if "DDP (TP=1, DP=2)" in implementations:
-        ddp_losses = np.array(implementations["DDP (TP=1, DP=2)"])
-
-        for name, losses in implementations.items():
-            if name == "DDP (TP=1, DP=2)":
-                continue
-            losses_arr = np.array(losses)
-            min_len = min(len(ddp_losses), len(losses_arr))
-            diff = losses_arr[:min_len] - ddp_losses[:min_len]
-            steps = list(range(min_len))
-            ax2.plot(steps, diff, label=f"{name} - DDP", color=colors[name], linewidth=1.5)
-
-        ax2.axhline(y=0, color="black", linestyle="--", alpha=0.5)
-        ax2.set_xlabel("Step", fontsize=12)
-        ax2.set_ylabel("Loss Difference", fontsize=12)
-        ax2.set_title("Loss Difference from DDP Baseline", fontsize=14)
-        ax2.legend(loc="upper right", fontsize=10)
-        ax2.grid(True, alpha=0.3)
+    ax.set_xlabel("Step", fontsize=12)
+    ax.set_ylabel("Loss", fontsize=12)
+    ax.set_title("Training Loss Curves", fontsize=14)
+    ax.legend(loc="upper right", fontsize=10)
+    ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")

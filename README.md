@@ -164,3 +164,73 @@ sampler = DistributedSampler(
 ### Checkpointing
 
 All workers save their model shards independently. Ray Train aggregates these into a single checkpoint that can be used for resuming training.
+
+## Verification
+
+This section describes how to verify the correctness of the three distributed training implementations (DDP, DeepSpeed AutoTP, FSDP+DTensor).
+
+### Overview
+
+For a fair comparison, all implementations must start from **identical initial weights**. The training scripts support this via:
+- `--init_weights_path`: Path to load/save initial model weights
+- `--save_init_weights`: Save initial weights before training (DDP only)
+
+### Prerequisites
+
+- 4 GPUs (for TP=2, DP=2 configuration)
+- Model: `Qwen/Qwen2.5-0.5B` (or any compatible model)
+- Python environment with PyTorch, DeepSpeed, and Ray Train installed
+
+### Quick Start
+
+```bash
+# Create output directories
+mkdir -p /tmp/shared_weights /tmp/loss_curves
+
+# Run all three implementations with shared weights
+./run_verification_main.sh
+```
+
+### Expected Results
+
+When using shared initial weights, you should see:
+
+#### Initial Loss
+All three implementations should have **nearly identical initial loss** (difference < 0.001):
+```
+DDP:       Initial=10.8732
+DeepSpeed: Initial=10.8736
+FSDP:      Initial=10.8736
+```
+
+#### Loss Curve Matching
+
+| Implementation | Max Diff from DDP | Mean Diff | Notes |
+|----------------|-------------------|-----------|-------|
+| FSDP+DTensor | < 0.02 | < 0.001 | Almost identical to DDP |
+| DeepSpeed AutoTP | < 0.5 | < 0.15 | Slightly different due to gradient clipping |
+
+#### Example Output
+```
+============================================================
+LOSS CURVE STATISTICS
+============================================================
+
+DDP (TP=1, DP=2):
+  Initial loss: 10.873175
+  Final loss:   4.644855
+  Min loss:     0.723590
+  Mean loss:    7.341280
+
+DeepSpeed AutoTP (TP=2, DP=2):
+  Initial loss: 10.873634
+  Final loss:   4.424264
+  Min loss:     0.475180
+  Mean loss:    7.223806
+
+FSDP+DTensor (TP=2, DP=2):
+  Initial loss: 10.873634
+  Final loss:   4.644554
+  Min loss:     0.723624
+  Mean loss:    7.341585
+```
