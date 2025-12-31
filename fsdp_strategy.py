@@ -1,5 +1,6 @@
 """FSDP2 + DTensor tensor parallelism strategy adapted for Ray Train."""
 
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Optional
 
@@ -118,6 +119,15 @@ class RayFSDPStrategy:
             if self.rank == 0:
                 print("[FSDP2+DTensor] Enabled activation checkpointing")
 
+        # Handle initial weights loading for verification
+        # This must happen BEFORE TP/FSDP sharding
+        init_weights_path = config.get("init_weights_path")
+        if init_weights_path and os.path.exists(init_weights_path):
+            state_dict = torch.load(init_weights_path, map_location=device, weights_only=True)
+            model.load_state_dict(state_dict)
+            if self.rank == 0:
+                print(f"[FSDP2+DTensor] Loaded initial weights from {init_weights_path}")
+
         # Get transformer layers
         layers = get_transformer_layers(model)
         if layers is None:
@@ -144,22 +154,27 @@ class RayFSDPStrategy:
             parallelize_module(layer, self.tp_mesh, tp_mapping)
 
         # Apply DTensor TP to embedding and lm_head for vocab parallelism
-        # Using loss_parallel=True for efficient loss computation with sharded vocab
-        vocab_parallel_mapping = {
-            "model.embed_tokens": RowwiseParallel(
-                input_layouts=Replicate(),
-                output_layouts=Shard(1),
-            ),
-            "lm_head": ColwiseParallel(
-                input_layouts=Shard(1),
-                output_layouts=Shard(-1),  # Shard output by vocab dimension for loss_parallel
-                use_local_output=False,
-            ),
-        }
-        parallelize_module(model, self.tp_mesh, vocab_parallel_mapping)
+        # (only if vocab_parallel is enabled)
+        self._vocab_parallel = config.get("vocab_parallel", False)
+        if self._vocab_parallel:
+            vocab_parallel_mapping = {
+                "model.embed_tokens": RowwiseParallel(
+                    input_layouts=Replicate(),
+                    output_layouts=Shard(1),
+                ),
+                "lm_head": ColwiseParallel(
+                    input_layouts=Shard(1),
+                    output_layouts=Shard(-1),  # Shard output by vocab dimension for loss_parallel
+                    use_local_output=False,
+                ),
+            }
+            parallelize_module(model, self.tp_mesh, vocab_parallel_mapping)
 
-        if self.rank == 0:
-            print("[FSDP2+DTensor] Applied vocab parallel TP to embedding and lm_head")
+            if self.rank == 0:
+                print("[FSDP2+DTensor] Applied vocab parallel TP to embedding and lm_head")
+        else:
+            if self.rank == 0:
+                print("[FSDP2+DTensor] Vocab parallel disabled - using full embedding/lm_head")
 
         # Apply FSDP2 (fully_shard) if dp_size > 1
         mp_policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
@@ -219,7 +234,10 @@ class RayFSDPStrategy:
             else nullcontext()
         )
 
-        with autocast_ctx, loss_parallel():
+        # Only use loss_parallel() when vocab_parallel is enabled
+        loss_ctx = loss_parallel() if self._vocab_parallel else nullcontext()
+
+        with autocast_ctx, loss_ctx:
             outputs = self.model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
@@ -248,9 +266,12 @@ class RayFSDPStrategy:
             else nullcontext()
         )
 
+        # Only use loss_parallel() when vocab_parallel is enabled
         # loss_parallel context MUST wrap both forward and backward for
         # correct gradient computation with vocab-sharded DTensor
-        with autocast_ctx, loss_parallel():
+        loss_ctx = loss_parallel() if self._vocab_parallel else nullcontext()
+
+        with autocast_ctx, loss_ctx:
             outputs = self.model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],

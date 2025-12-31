@@ -1,19 +1,15 @@
-# Anyscale Job: Ray Train + FSDP2 + DTensor Tensor Parallelism
-# This job runs training with PyTorch native FSDP2 + DTensor for tensor parallelism
+# Anyscale Job: Ray Train + DDP (Baseline)
+# This job runs DDP training as a baseline and saves initial weights for verification.
+# Run this FIRST before DeepSpeed/FSDP jobs to create shared initial weights.
 #
-# For verification, run job_ddp.yaml FIRST to create shared initial weights.
-#
-# Submit with: anyscale job submit -f job_fsdp.yaml
-# Or with custom args: anyscale job submit -f job_fsdp.yaml --entrypoint "python train_fsdp.py --tp_size 4 --dp_size 2 --num_workers 8"
+# Submit with: anyscale job submit -f job_ddp.yaml
 
-name: train-fsdp-dtensor
+name: train-ddp-baseline
 
 entrypoint: >
-  python train_fsdp.py
+  python train_ddp.py
   --model_name Qwen/Qwen2.5-0.5B
-  --tp_size 2
-  --dp_size 2
-  --num_workers 4
+  --num_workers 2
   --dataset_name wikitext
   --dataset_percentage 1.0
   --batch_size 2
@@ -24,7 +20,7 @@ entrypoint: >
   --debug_steps 100
   --loss_output_dir /mnt/cluster_storage/loss_curves
   --init_weights_path /mnt/cluster_storage/shared_weights/init_weights.pt
-  --autocast
+  --save_init_weights
 
 image_uri: anyscale/ray:2.53.0-py312-cu128
 
@@ -52,4 +48,5 @@ max_retries: 0
 
 tags:
   project: tensor-parallelism
-  framework: fsdp
+  framework: ddp
+  role: baseline

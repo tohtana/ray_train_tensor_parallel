@@ -79,6 +79,8 @@ def train_loop_per_worker(config: Dict[str, Any]) -> None:
             "attn_impl": config.get("attn_impl", "sdpa"),
             "activation_checkpointing": config.get("activation_checkpointing", False),
             "autocast": config.get("autocast", False),
+            "vocab_parallel": config.get("vocab_parallel", False),
+            "init_weights_path": config.get("init_weights_path"),
         },
     )
 
@@ -101,6 +103,11 @@ def get_args():
         action="store_true",
         help="Enable torch.autocast for mixed precision",
     )
+    parser.add_argument(
+        "--vocab_parallel",
+        action="store_true",
+        help="Enable vocab parallel for embedding/lm_head (disabled by default)",
+    )
 
     return parser.parse_args()
 
@@ -112,6 +119,8 @@ def main():
     # Build train_loop_config
     train_loop_config = get_common_train_config(args)
     train_loop_config["autocast"] = args.autocast
+    train_loop_config["vocab_parallel"] = args.vocab_parallel
+    train_loop_config["impl_name"] = "fsdp"
 
     # Run trainer
     run_trainer(

@@ -86,6 +86,8 @@ def train_loop_per_worker(config: Dict[str, Any]) -> None:
             "num_layers": config.get("num_layers", 0),
             "attn_impl": config.get("attn_impl", "sdpa"),
             "activation_checkpointing": config.get("activation_checkpointing", False),
+            "vocab_parallel": config.get("vocab_parallel", False),
+            "init_weights_path": config.get("init_weights_path"),
         },
     )
 
@@ -110,6 +112,11 @@ def get_args():
         choices=[0, 1, 2],
         help="DeepSpeed ZeRO stage (0-2, ZeRO-3 not supported with AutoTP)",
     )
+    parser.add_argument(
+        "--vocab_parallel",
+        action="store_true",
+        help="Enable vocab parallel for embedding/lm_head (disabled by default)",
+    )
 
     return parser.parse_args()
 
@@ -121,6 +128,8 @@ def main():
     # Build train_loop_config
     train_loop_config = get_common_train_config(args)
     train_loop_config["zero_stage"] = args.zero_stage
+    train_loop_config["vocab_parallel"] = args.vocab_parallel
+    train_loop_config["impl_name"] = "deepspeed"
 
     # Run trainer
     run_trainer(

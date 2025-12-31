@@ -1,176 +1,110 @@
 """
-Common utilities shared between DeepSpeed AutoTP and FSDP+DTensor training scripts.
+Ray Train + DDP (Distributed Data Parallel) Training.
+
+This script serves as a baseline reference to verify the correctness of
+tensor parallelism implementations. It uses standard PyTorch DDP for
+data parallelism only (no tensor parallelism).
+
+Example usage:
+    # 4 GPUs: 4-way data parallelism
+    python train_ddp.py \
+        --model_name Qwen/Qwen2-7B \
+        --num_workers 4 \
+        --dataset_name wikitext \
+        --batch_size 2 \
+        --seq_length 2048 \
+        --num_epochs 3
+
+    # 8 GPUs: 8-way data parallelism
+    python train_ddp.py \
+        --model_name Qwen/Qwen2-7B \
+        --num_workers 8 \
+        --dataset_name wikitext \
+        --batch_size 1 \
+        --seq_length 2048 \
+        --num_epochs 3
 """
 
 import argparse
-import json
-import logging
 import os
-import tempfile
 import uuid
-from typing import Any, Callable, Dict, Protocol
+from typing import Any, Dict
+
+os.environ["RAY_TRAIN_V2_ENABLED"] = "1"
 
 import torch
 
-import ray
 import ray.train
 import ray.train.torch
-from ray.train import Checkpoint, RunConfig, ScalingConfig
+from ray.train import RunConfig, ScalingConfig
 from ray.train.torch import TorchTrainer
 
+from common import (
+    log_rank0,
+    save_checkpoint,
+    load_checkpoint,
+)
 from data import create_tp_aware_dataloader
-
-logger = logging.getLogger(__name__)
-
-
-class TPStrategy(Protocol):
-    """Protocol defining the interface for tensor parallelism strategies."""
-
-    tp_rank: int
-    dp_rank: int
-    tp_size: int
-    dp_size: int
-
-    def setup(self, model_name: str, device: torch.device, dtype: torch.dtype, config: Dict[str, Any]) -> None:
-        ...
-
-    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        ...
-
-    def backward(self, loss: torch.Tensor) -> None:
-        ...
-
-    def forward_backward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Optional: Combined forward+backward for strategies that need it (e.g., DTensor with loss_parallel)."""
-        ...
-
-    def optimizer_step(self) -> None:
-        ...
-
-    def zero_grad(self) -> None:
-        ...
-
-    def train(self) -> None:
-        ...
-
-    def save_checkpoint(self, checkpoint_dir: str, tag: str = "model") -> None:
-        ...
-
-    def load_checkpoint(self, checkpoint_dir: str, tag: str = "model") -> None:
-        ...
+from ddp_strategy import RayDDPStrategy
 
 
-def log_rank0(message: str) -> None:
-    """Log message only from rank 0."""
-    if ray.train.get_context().get_world_rank() == 0:
-        logger.info(message)
-
-
-def save_checkpoint(
-    strategy: TPStrategy,
-    epoch: int,
-    step: int,
-    metrics: Dict[str, Any],
-) -> None:
+def train_loop_per_worker(config: Dict[str, Any]) -> None:
     """
-    Save checkpoint and report to Ray Train.
-
-    All workers save their checkpoint shards, then report to Ray Train.
-    Ray Train aggregates checkpoints from all workers properly.
+    Main training loop executed by each Ray Train worker.
 
     Args:
-        strategy: The TP strategy containing the model/engine
-        epoch: Current epoch number
-        step: Current step number
-        metrics: Training metrics to report
+        config: Training configuration dict
     """
-    world_rank = ray.train.get_context().get_world_rank()
+    # Get Ray Train context
+    ctx = ray.train.get_context()
+    world_rank = ctx.get_world_rank()
+    world_size = ctx.get_world_size()
+    device = ray.train.torch.get_device()
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        checkpoint_dir = os.path.join(tmp_dir, "checkpoint")
-        os.makedirs(checkpoint_dir, exist_ok=True)
+    log_rank0(f"Worker started: world_rank={world_rank}, world_size={world_size}")
 
-        # Save checkpoint (each rank saves its shard)
-        strategy.save_checkpoint(checkpoint_dir, tag="model")
+    # Create and setup the DDP strategy
+    strategy = RayDDPStrategy()
 
-        # Save metadata (from world rank 0 only)
-        if world_rank == 0:
-            metadata = {"epoch": epoch, "step": step}
-            with open(os.path.join(checkpoint_dir, "metadata.json"), "w") as f:
-                json.dump(metadata, f)
+    strategy.setup(
+        model_name=config["model_name"],
+        device=device,
+        dtype=torch.bfloat16,
+        config={
+            "learning_rate": config["learning_rate"],
+            "weight_decay": config.get("weight_decay", 0.01),
+            "num_layers": config.get("num_layers", 0),
+            "attn_impl": config.get("attn_impl", "sdpa"),
+            "activation_checkpointing": config.get("activation_checkpointing", False),
+            "autocast": config.get("autocast", True),
+            "init_weights_path": config.get("init_weights_path"),
+            "save_init_weights": config.get("save_init_weights", False),
+        },
+    )
 
-        # All workers must call report() with their checkpoint
-        checkpoint = Checkpoint.from_directory(tmp_dir)
-        ray.train.report(metrics, checkpoint=checkpoint)
-
-    if world_rank == 0:
-        experiment_name = ray.train.get_context().get_experiment_name()
-        log_rank0(f"Checkpoint saved for experiment {experiment_name}. Metrics: {metrics}")
-
-
-def load_checkpoint(
-    strategy: TPStrategy,
-    checkpoint: ray.train.Checkpoint,
-) -> Dict[str, Any]:
-    """
-    Load checkpoint for resuming training.
-
-    Each rank loads its corresponding checkpoint shard.
-
-    Args:
-        strategy: The TP strategy containing the model/engine
-        checkpoint: Ray Train checkpoint to load
-
-    Returns:
-        Metadata dict with epoch and step info
-    """
-    metadata = {"epoch": 0, "step": 0}
-
-    try:
-        with checkpoint.as_directory() as checkpoint_dir:
-            log_rank0(f"Loading checkpoint from {checkpoint_dir}")
-            ckpt_dir = os.path.join(checkpoint_dir, "checkpoint")
-            if not os.path.isdir(ckpt_dir):
-                ckpt_dir = checkpoint_dir
-
-            # Load checkpoint (each rank loads its shard)
-            strategy.load_checkpoint(ckpt_dir, tag="model")
-
-            # Read metadata
-            metadata_file = os.path.join(ckpt_dir, "metadata.json")
-            if os.path.isfile(metadata_file):
-                with open(metadata_file, "r") as f:
-                    metadata = json.load(f)
-
-            # Synchronize across all workers
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                torch.distributed.barrier()
-
-        log_rank0(f"Successfully loaded checkpoint. Epoch: {metadata.get('epoch', 0)}")
-
-    except Exception as e:
-        logger.error(f"Failed to load checkpoint: {e}")
-        raise RuntimeError(f"Checkpoint loading failed: {e}") from e
-
-    return metadata
+    # Run training loop
+    run_ddp_training_loop(strategy, config)
 
 
-def run_training_loop(
-    strategy: TPStrategy,
+def run_ddp_training_loop(
+    strategy: RayDDPStrategy,
     config: Dict[str, Any],
 ) -> None:
     """
-    Run the common training loop for any TP strategy.
+    Run the training loop for DDP.
+
+    This is similar to run_training_loop in common.py but adapted for DDP
+    where all workers have the full model and use standard data sharding.
 
     Args:
-        strategy: The TP strategy (already set up)
+        strategy: The DDP strategy (already set up)
         config: Training configuration dict
     """
     world_rank = ray.train.get_context().get_world_rank()
     device = ray.train.torch.get_device()
 
-    # Create TP-aware dataloader
-    # Uses dp_rank/dp_size for sharding, not world_rank/world_size
+    # Create TP-aware dataloader (uses dp_rank/dp_size)
+    # For DDP: dp_rank = world_rank, dp_size = world_size
     dataloader = create_tp_aware_dataloader(
         model_name=config["model_name"],
         dataset_name=config["dataset_name"],
@@ -207,25 +141,18 @@ def run_training_loop(
         running_loss = 0.0
         num_batches = 0
 
-        # Check if strategy has combined forward_backward (needed for DTensor with loss_parallel)
-        use_forward_backward = hasattr(strategy, "forward_backward") and callable(
-            getattr(strategy, "forward_backward", None)
-        )
-
         for step, batch in enumerate(dataloader):
             # Move batch to device
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            # Zero gradients (for FSDP, DeepSpeed handles this internally)
+            # Zero gradients
             strategy.zero_grad()
 
-            if use_forward_backward:
-                # Combined forward+backward (required for DTensor with loss_parallel)
-                loss = strategy.forward_backward(batch)
-            else:
-                # Separate forward and backward passes
-                loss = strategy.forward(batch)
-                strategy.backward(loss)
+            # Forward pass
+            loss = strategy.forward(batch)
+
+            # Backward pass
+            strategy.backward(loss)
 
             # Track per-step loss
             loss_value = loss.item()
@@ -263,17 +190,21 @@ def run_training_loop(
 
     # Save loss history if output_dir is specified (rank 0 only)
     output_dir = config.get("loss_output_dir")
-    impl_name = config.get("impl_name", "unknown")
     if output_dir and world_rank == 0:
+        import json
         os.makedirs(output_dir, exist_ok=True)
-        loss_file = os.path.join(output_dir, f"loss_{impl_name}.json")
+        loss_file = os.path.join(output_dir, "loss_ddp.json")
         with open(loss_file, "w") as f:
-            json.dump({"implementation": impl_name, "loss_history": loss_history}, f)
+            json.dump({"implementation": "ddp", "loss_history": loss_history}, f)
         log_rank0(f"Loss history saved to {loss_file}")
 
 
-def add_common_args(parser: argparse.ArgumentParser) -> None:
-    """Add common arguments shared by all training scripts."""
+def get_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Ray Train + DDP Distributed Data Parallel Training (Baseline)"
+    )
+
     # Model configuration
     parser.add_argument(
         "--model_name",
@@ -297,22 +228,10 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 
     # Parallelism configuration
     parser.add_argument(
-        "--tp_size",
-        type=int,
-        required=True,
-        help="Tensor parallel degree",
-    )
-    parser.add_argument(
-        "--dp_size",
-        type=int,
-        default=1,
-        help="Data parallel degree",
-    )
-    parser.add_argument(
         "--num_workers",
         type=int,
         required=True,
-        help="Total number of workers (must equal tp_size * dp_size)",
+        help="Number of workers (data parallelism degree)",
     )
 
     # Dataset configuration
@@ -361,21 +280,15 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Weight decay",
     )
     parser.add_argument(
-        "--max_grad_norm",
-        type=float,
-        default=1.0,
-        help="Gradient clipping norm",
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps",
-        type=int,
-        default=1,
-        help="Gradient accumulation steps",
-    )
-    parser.add_argument(
         "--activation_checkpointing",
         action="store_true",
         help="Enable activation/gradient checkpointing",
+    )
+    parser.add_argument(
+        "--autocast",
+        action="store_true",
+        default=True,
+        help="Enable torch.autocast for mixed precision (default: True)",
     )
 
     # Checkpointing configuration
@@ -435,17 +348,24 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Save initial model weights to --init_weights_path before training",
     )
 
+    return parser.parse_args()
 
-def get_common_train_config(args: argparse.Namespace) -> Dict[str, Any]:
-    """Build common train_loop_config from parsed args."""
-    return {
+
+def main():
+    """Main entry point."""
+    args = get_args()
+
+    print(f"Configuration: {args}")
+
+    # Build train_loop_config
+    train_loop_config = {
         # Model
         "model_name": args.model_name,
         "num_layers": args.num_layers,
         "attn_impl": args.attn_impl,
-        # Parallelism
-        "tp_size": args.tp_size,
-        "dp_size": args.dp_size,
+        # Parallelism - DDP has no TP, only DP
+        "tp_size": 1,
+        "dp_size": args.num_workers,
         # Dataset
         "dataset_name": args.dataset_name,
         "dataset_percentage": args.dataset_percentage,
@@ -455,9 +375,8 @@ def get_common_train_config(args: argparse.Namespace) -> Dict[str, Any]:
         "num_epochs": args.num_epochs,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
-        "max_grad_norm": args.max_grad_norm,
-        "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "activation_checkpointing": args.activation_checkpointing,
+        "autocast": args.autocast,
         # Logging/debugging
         "log_interval": args.log_interval,
         "debug_steps": args.debug_steps,
@@ -468,31 +387,6 @@ def get_common_train_config(args: argparse.Namespace) -> Dict[str, Any]:
         "init_weights_path": args.init_weights_path,
         "save_init_weights": args.save_init_weights,
     }
-
-
-def run_trainer(
-    args: argparse.Namespace,
-    train_loop_per_worker: Callable[[Dict[str, Any]], None],
-    train_loop_config: Dict[str, Any],
-    experiment_prefix: str,
-) -> None:
-    """
-    Common trainer setup and execution.
-
-    Args:
-        args: Parsed command line arguments
-        train_loop_per_worker: The training loop function
-        train_loop_config: Configuration dict for training
-        experiment_prefix: Prefix for auto-generated experiment names
-    """
-    # Validate parallelism configuration
-    if args.tp_size * args.dp_size != args.num_workers:
-        raise ValueError(
-            f"tp_size ({args.tp_size}) * dp_size ({args.dp_size}) "
-            f"must equal num_workers ({args.num_workers})"
-        )
-
-    print(f"Configuration: {args}")
 
     # Configure Ray Train
     scaling_config = ScalingConfig(
@@ -506,7 +400,7 @@ def run_trainer(
         if args.resume_from is not None:
             name = args.resume_from
         else:
-            name = f"{experiment_prefix}_tp{args.tp_size}_dp{args.dp_size}_{uuid.uuid4().hex[:8]}"
+            name = f"ddp_dp{args.num_workers}_{uuid.uuid4().hex[:8]}"
 
     print(f"Experiment name: {name}")
 
@@ -525,3 +419,7 @@ def run_trainer(
 
     result = trainer.fit()
     print(f"Training finished. Result: {result}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,5 +1,6 @@
 """DeepSpeed AutoTP tensor parallelism strategy adapted for Ray Train."""
 
+import os
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -97,6 +98,42 @@ class RayAutoTPStrategy:
             print(f"[AutoTP] DP groups: {dp_groups}")
             print(f"[AutoTP] Rank {self.rank}: tp_rank={self.tp_rank}, dp_rank={self.dp_rank}")
 
+    def _sync_model_weights(self, model: nn.Module) -> None:
+        """
+        Synchronize all model weights within each TP group.
+
+        This is necessary because each rank creates the model with different
+        random initializations, but DeepSpeed tp_model_init() expects all
+        ranks to have identical weights before sharding.
+
+        With 2D parallelism (DP x TP), we have multiple TP groups:
+        - TP group 0: global ranks [0, 1, ..., tp_size-1]
+        - TP group 1: global ranks [tp_size, tp_size+1, ..., 2*tp_size-1]
+        - etc.
+
+        Each TP group broadcasts from its first member (tp_rank=0).
+
+        Args:
+            model: The model to synchronize
+        """
+        if self.tp_group is None or self.tp_size <= 1:
+            return
+
+        # The source rank for broadcast is the first rank in this TP group
+        # With 2D layout: TP group i contains ranks [i*tp_size, (i+1)*tp_size)
+        # So the first rank in this TP group is dp_rank * tp_size
+        tp_group_first_rank = self.dp_rank * self.tp_size
+
+        if self.rank == 0:
+            print(f"[AutoTP] Synchronizing model weights within each TP group...")
+
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                dist.broadcast(param.data, src=tp_group_first_rank, group=self.tp_group)
+
+        if self.tp_rank == 0:
+            print(f"[AutoTP] Model weights synchronized in TP group (src_rank={tp_group_first_rank})")
+
     def _create_mpu(self) -> "ModelParallelUnit":
         """
         Create a Model Parallel Unit (MPU) for DeepSpeed.
@@ -175,6 +212,27 @@ class RayAutoTPStrategy:
             if self.rank == 0:
                 print("[AutoTP] Enabled activation checkpointing")
 
+        # Handle initial weights loading for verification
+        # This must happen BEFORE weight synchronization so all ranks load the same weights
+        init_weights_path = config.get("init_weights_path")
+        if init_weights_path and os.path.exists(init_weights_path):
+            state_dict = torch.load(init_weights_path, map_location=device, weights_only=True)
+            model.load_state_dict(state_dict)
+            if self.rank == 0:
+                print(f"[AutoTP] Loaded initial weights from {init_weights_path}")
+            # Skip weight synchronization since all ranks now have identical weights
+            skip_sync = True
+        else:
+            skip_sync = False
+
+        # CRITICAL: Broadcast ALL model weights from rank 0 to all TP ranks before sharding.
+        # DeepSpeed tp_model_init() shards weights but doesn't synchronize them across ranks.
+        # Without this, each rank would have different random initializations, leading to
+        # incorrect model behavior after sharding.
+        # Skip if we loaded weights from checkpoint (all ranks already have identical weights)
+        if not skip_sync:
+            self._sync_model_weights(model)
+
         # Apply TP sharding with deepspeed.tp_model_init()
         # Pass the TP group so DeepSpeed knows which ranks share model shards
         model = deepspeed.tp_model_init(
@@ -185,8 +243,12 @@ class RayAutoTPStrategy:
         )
 
         # Apply vocabulary-parallel embedding for proper parallel loss computation
-        if self.tp_group is not None:
+        # (only if vocab_parallel is enabled)
+        self._vocab_parallel = config.get("vocab_parallel", False)
+        if self.tp_group is not None and self._vocab_parallel:
             self._apply_vocab_parallel_embedding(model, device, dtype)
+        elif self.rank == 0:
+            print("[AutoTP] Vocab parallel disabled - using full embedding/lm_head")
 
         # Get all parameters
         params = list(model.parameters())
@@ -273,6 +335,10 @@ class RayAutoTPStrategy:
 
         DeepSpeed AutoTP doesn't partition embeddings/lm_head by vocabulary dimension,
         so we replace them with VocabParallelEmbedding for correct loss computation.
+
+        IMPORTANT: The embedding weights must be synchronized across TP ranks before
+        partitioning, because DeepSpeed tp_model_init() does not synchronize embedding
+        weights and each rank may have different random initializations.
         """
         original_embedding = get_embedding_module(model)
         if original_embedding is None:
@@ -285,6 +351,9 @@ class RayAutoTPStrategy:
                 f"[AutoTP] Replacing embedding with VocabParallelEmbedding "
                 f"(vocab_size={original_embedding.num_embeddings}, tp_size={self.tp_size})"
             )
+
+        # Note: Embedding weights are already synchronized by _sync_model_weights()
+        # before tp_model_init(), so no additional broadcast is needed here.
 
         # Create VocabParallelEmbedding
         vocab_parallel_embedding = VocabParallelEmbedding(
@@ -316,11 +385,15 @@ class RayAutoTPStrategy:
             tie_word_embeddings = getattr(model.config, "tie_word_embeddings", True)
             if tie_word_embeddings:
                 # Tied weights: lm_head shares weight with embedding
+                # Since embedding weights were already broadcasted and partitioned,
+                # just tie lm_head to the new VocabParallelEmbedding weight
                 lm_head.weight = vocab_parallel_embedding.weight
                 if self.rank == 0:
                     print("[AutoTP] lm_head weight tied to VocabParallelEmbedding")
             else:
                 # Untied weights: lm_head needs its own partitioned weight
+                # Note: lm_head weights are already synchronized by _sync_model_weights()
+                # before tp_model_init(), so no additional broadcast is needed here.
                 original_lm_head_weight = lm_head.weight.data.clone()
                 lm_head.weight = nn.Parameter(
                     original_lm_head_weight[start_idx:end_idx, :].to(device)
@@ -336,9 +409,8 @@ class RayAutoTPStrategy:
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Run forward pass with AutoTP model."""
-        # We use vocab-parallel loss computation because the model's built-in loss
-        # would use the full vocabulary while we have partitioned embeddings/lm_head
-        if self.tp_group is not None:
+        # Use vocab-parallel loss computation only if vocab_parallel is enabled
+        if self._vocab_parallel and self.tp_group is not None:
             outputs = self.engine(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
@@ -355,7 +427,7 @@ class RayAutoTPStrategy:
             )
             return loss
         else:
-            # Single GPU case - use model's built-in loss computation
+            # Use model's built-in loss computation (full embedding/lm_head)
             outputs = self.engine(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
